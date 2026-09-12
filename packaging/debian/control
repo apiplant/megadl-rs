@@ -1,0 +1,12 @@
+Package: megadl-rs
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/megadl-rs
+Description: Command-line downloader and terminal download manager for mega.nz links
+ megadl and megadl-tui download files and folders from public mega.nz links,
+ implemented directly against MEGA's API and crypto with resumable,
+ MAC-verified transfers.

@@ -1,0 +1,451 @@
+name: release
+
+# Tag a version to cut a release:
+#
+#   git tag v0.x.0 && git push origin v0.x.0
+#
+# That builds `megadl` and `megadl-tui` for every supported platform and
+# attaches the archives, checksums, and distro packages to the GitHub release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run: no release is published)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A release build is LTO + one codegen unit; the extra debug info earlier
+  # stages emit is stripped anyway.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Both binaries from one workspace: the CLI and the TUI. The archive
+      # carries both.
+      - name: Build
+        run: |
+          cargo build --release --locked --bin megadl --target ${{ matrix.target }}
+          cargo build --release --locked --bin megadl-tui --target ${{ matrix.target }}
+
+      # One archive per target, named after it, holding both binaries and the
+      # README — enough to unpack anywhere and run.
+      - name: Package
+        shell: bash
+        run: |
+          name="megadl-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/megadl" "$name/"
+          cp "target/${{ matrix.target }}/release/megadl-tui" "$name/"
+          cp README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            megadl-rs-*.tar.gz
+            megadl-rs-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Repackaging, not building: the .debs and the pacman package are assembled
+  # on one runner from the archives the `binaries` job produced, because
+  # putting an already-built binary into an ar or zst archive is
+  # architecture-independent work.
+  packages:
+    name: distro packages
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Build the Debian packages
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p debs
+
+          build() { # <debian arch> <rust target>
+            local arch="$1" triple="$2"
+
+            tar xzf "dist/megadl-rs-${GITHUB_REF_NAME}-$triple.tar.gz"
+            local src="megadl-rs-${GITHUB_REF_NAME}-$triple"
+            local root="stage/megadl-rs-$arch"
+
+            install -Dm755 "$src/megadl" "$root/usr/bin/megadl"
+            install -Dm755 "$src/megadl-tui" "$root/usr/bin/megadl-tui"
+            install -Dm644 "$src/README.md" "$root/usr/share/doc/megadl-rs/README.md"
+
+            # dpkg reports installed size in KiB, and dpkg-deb does not work
+            # it out on its own — a missing or wrong value is what makes
+            # `apt` mis-report what an install will cost.
+            local size
+            size=$(du -ks "$root/usr" | cut -f1)
+
+            install -d "$root/DEBIAN"
+            sed -e "s/@VERSION@/$version/" \
+                -e "s/@ARCH@/$arch/" \
+                -e "s/@INSTALLED_SIZE@/$size/" \
+                "packaging/debian/control" > "$root/DEBIAN/control"
+
+            if grep -qE '@[A-Z_]+@' "$root/DEBIAN/control"; then
+              echo "::error::unsubstituted placeholder in the control file" >&2
+              exit 1
+            fi
+
+            # Everything ships as root:root regardless of who the runner is.
+            dpkg-deb --root-owner-group --build "$root" \
+              "debs/megadl-rs_${version}-1_${arch}.deb"
+          }
+
+          build amd64 x86_64-unknown-linux-gnu
+          build arm64 aarch64-unknown-linux-gnu
+
+          cd debs
+          for deb in *.deb; do shasum -a 256 "$deb" > "$deb.sha256"; done
+
+      # Only x86_64: the pacman repository serves that one architecture, and an
+      # aarch64 package would need either an arm runner or emulation for no
+      # audience. The Arch tooling comes from a container rather than the
+      # runner, so this stays a step in the same job as the .debs.
+      - name: Build the pacman package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p pkg
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA_LINUX_X86_64@/$(sha256sum "dist/megadl-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)/" \
+            "packaging/pacman/PKGBUILD" > "pkg/PKGBUILD"
+
+          if grep -qE '@[A-Z_]+@' "pkg/PKGBUILD"; then
+            echo "::error::unsubstituted placeholder in PKGBUILD" >&2
+            grep -nE '@[A-Z_]+@' "pkg/PKGBUILD" >&2
+            exit 1
+          fi
+
+          # The release does not exist yet, so the archive is placed under the
+          # name the source line gives it: makepkg checksums what is already
+          # there instead of fetching the URL.
+          cp "dist/megadl-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+             "pkg/megadl-rs-$version-x86_64.tar.gz"
+
+          # makepkg refuses to run as root, so the build runs as an unprivileged
+          # user inside the container — and the tree is handed back to the
+          # runner's own uid afterwards, or the steps below cannot write to it.
+          docker run --rm -v "$PWD/pkg:/pkg" -e "OWNER=$(id -u):$(id -g)" \
+            archlinux:base-devel bash -c '
+              set -eu
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c "cd /pkg && makepkg --cleanbuild --force --nodeps -p PKGBUILD"
+              chown -R "$OWNER" /pkg
+            '
+
+          [ -f "pkg/megadl-rs-$version-1-x86_64.pkg.tar.zst" ]
+          cd pkg
+          shasum -a 256 "megadl-rs-$version-1-x86_64.pkg.tar.zst" \
+            > "megadl-rs-$version-1-x86_64.pkg.tar.zst.sha256"
+
+      # A package that installs but declares the wrong architecture, or that
+      # quietly lost a binary, is worth catching before it is a release asset.
+      - name: Check
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dpkg-deb --info "debs/megadl-rs_${version}-1_amd64.deb"
+          dpkg-deb --contents "debs/megadl-rs_${version}-1_amd64.deb" | grep -q './usr/bin/megadl'
+          dpkg-deb --contents "debs/megadl-rs_${version}-1_amd64.deb" | grep -q './usr/bin/megadl-tui'
+          [ "$(dpkg-deb --field "debs/megadl-rs_${version}-1_arm64.deb" Architecture)" = arm64 ]
+
+          # The runner is amd64, so only that one can actually be installed and
+          # run — which is the check that matters: `--version` proves the
+          # binary survived the round trip.
+          sudo dpkg -i "debs/megadl-rs_${version}-1_amd64.deb" || sudo apt-get install -fy
+          [ "$(megadl --version)" = "megadl $version" ]
+          [ "$(megadl-tui --version)" = "megadl-tui $version" ]
+          sudo dpkg -r megadl-rs
+
+          # The pacman package cannot be installed on the runner, but its
+          # metadata and contents can be read back out of the archive.
+          docker run --rm -v "$PWD/pkg:/pkg" archlinux:base-devel bash -c "
+            set -eu
+            pkg=/pkg/megadl-rs-$version-1-x86_64.pkg.tar.zst
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgname = megadl-rs'
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgver = $version-1'
+            bsdtar -tf \"\$pkg\" | grep -qx 'usr/bin/megadl'
+            bsdtar -tf \"\$pkg\" | grep -qx 'usr/bin/megadl-tui'
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            debs/*.deb
+            debs/*.deb.sha256
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacman-package
+          path: |
+            pkg/*.pkg.tar.zst
+            pkg/*.pkg.tar.zst.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [binaries, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: debian-packages
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Binaries
+
+            | platform | archive |
+            | --- | --- |
+            | macOS Apple Silicon | `megadl-rs-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` |
+            | Linux x86_64 | `megadl-rs-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux aarch64 | `megadl-rs-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz` |
+
+            Each archive holds both `megadl` and `megadl-tui`.
+
+            ## Debian packages
+
+            ```
+            sudo dpkg -i megadl-rs_${{ steps.version.outputs.version }}-1_amd64.deb
+            ```
+
+            | platform | package |
+            | --- | --- |
+            | Debian/Ubuntu amd64 | `megadl-rs_${{ steps.version.outputs.version }}-1_amd64.deb` |
+            | Debian/Ubuntu arm64 | `megadl-rs_${{ steps.version.outputs.version }}-1_arm64.deb` |
+
+            ## Arch package
+
+            ```
+            sudo pacman -U megadl-rs-${{ steps.version.outputs.version }}-1-x86_64.pkg.tar.zst
+            ```
+
+            The same package is published to the signed pacman repository at
+            `apiplant.github.io/pacman`, which is the way to get updates with
+            `pacman -Syu` — see `packaging/README.md` for the one-time setup.
+
+            ## Homebrew
+
+            ```
+            brew install apiplant/tap/megadl-rs
+            ```
+
+            Each archive and package has a matching `.sha256` file.
+
+  # The formula points at the release archives by URL, so it should only
+  # publish after the release itself exists — hence `needs: release` rather
+  # than running alongside it. Guarded on its credential: a fork, or this
+  # repository before the secret is set, skips it instead of failing the run.
+  homebrew:
+    name: homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Render the formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha() { shasum -a 256 "dist/megadl-rs-${GITHUB_REF_NAME}-$1.tar.gz" | cut -d' ' -f1; }
+
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA_MACOS_ARM64@/$(sha aarch64-apple-darwin)/" \
+            -e "s/@SHA_LINUX_X86_64@/$(sha x86_64-unknown-linux-gnu)/" \
+            -e "s/@SHA_LINUX_ARM64@/$(sha aarch64-unknown-linux-gnu)/" \
+            "packaging/homebrew/megadl-rs.rb" > "/tmp/megadl-rs.rb"
+
+          # A leftover placeholder means an archive was missing and `sha`
+          # returned nothing — publishing that formula would break `brew
+          # install` for everyone on that platform.
+          if grep -qE '@[A-Z_]+@' "/tmp/megadl-rs.rb"; then
+            echo "::error::unsubstituted placeholder in megadl-rs.rb" >&2
+            grep -nE '@[A-Z_]+@' "/tmp/megadl-rs.rb" >&2
+            exit 1
+          fi
+
+      - name: Push to apiplant/homebrew-tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/apiplant/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp /tmp/megadl-rs.rb tap/Formula/megadl-rs.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/megadl-rs.rb
+          # Re-running a release for the same tag is a no-op rather than an error.
+          git diff --cached --quiet && exit 0
+          git commit -m "megadl-rs $version"
+          git push
+
+  # The pacman repository is cumulative: the new package file is copied into
+  # the architecture directory, signed, and added to the repository database
+  # alongside the packages from other apiplant releases. x86_64 only, matching
+  # what the `packages` job builds.
+  pacman:
+    name: pacman repository
+    needs: [release, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      PACMAN_REPO_TOKEN: ${{ secrets.PACMAN_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: pacman -Sy --noconfirm --needed git gnupg ca-certificates
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - name: Import the signing key
+        if: env.PACMAN_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::PACMAN_REPO_TOKEN is set but PACMAN_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the package to the pool
+        if: env.PACMAN_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${PACMAN_REPO_TOKEN}@github.com/apiplant/pacman.git" repo
+
+          mkdir -p repo/x86_64
+          cp dist/*.pkg.tar.zst repo/x86_64/
+
+      - name: Sign, index and publish
+        if: env.PACMAN_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          sign() {
+            rm -f "$1.sig"
+            if [ -n "$GPG_PASSPHRASE" ]; then
+              gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --local-user "$keyid" --detach-sign "$1"
+            else
+              gpg --batch --yes --local-user "$keyid" --detach-sign "$1"
+            fi
+          }
+
+          pkgs=$(printf '%s\n' "$PWD/x86_64"/*.pkg.tar.zst)
+          for pkg in $pkgs; do
+            sign "$pkg"
+          done
+
+          repo-add --include-sigs "x86_64/apiplant.db.tar.zst" $pkgs
+
+          # repo-add leaves apiplant.db and apiplant.files as symlinks to the
+          # .tar.zst files. git stores a symlink as its target path, and GitHub
+          # Pages serves that back as a plain text file — so `pacman -Sy` would
+          # download the string "apiplant.db.tar.zst" instead of a database.
+          # Real copies are what gets committed.
+          for name in apiplant.db apiplant.files; do
+            cp --remove-destination "x86_64/$name.tar.zst" "x86_64/$name"
+          done
+
+          sign "x86_64/apiplant.db"
+          sign "x86_64/apiplant.files"
+
+          rm -f apiplant.gpg
+          gpg --armor --export "$keyid" > apiplant.gpg
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "megadl-rs $version"
+          git push
