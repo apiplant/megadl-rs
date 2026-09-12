@@ -31,6 +31,48 @@ megadl-tui
 
 Run `megadl --help` for the full option list.
 
+## Installation
+
+macOS (Apple Silicon) and Linux, via Homebrew:
+
+```sh
+brew tap apiplant/tap
+brew install apiplant/tap/megadl-rs
+```
+
+Arch Linux, via the signed pacman repository at `apiplant.github.io/pacman`
+(one-time setup, then `pacman -Sy`/`-Syu` picks up new releases):
+
+```sh
+curl -sSfL https://apiplant.github.io/pacman/apiplant.gpg -o /tmp/apiplant.gpg
+keyid=$(gpg --show-keys --with-colons /tmp/apiplant.gpg | awk -F: '/^pub:/ { print $5; exit }') && sudo pacman-key --add /tmp/apiplant.gpg && sudo pacman-key --finger "$keyid" && sudo pacman-key --lsign-key "$keyid"
+printf '\n[apiplant]\nSigLevel = Required DatabaseOptional\nServer = https://apiplant.github.io/pacman/$arch\n' | sudo tee -a /etc/pacman.conf > /dev/null
+sudo pacman -Sy megadl-rs
+```
+
+Debian/Ubuntu, via the signed apt repository at `apt.apiplant.com` (one-time
+setup, then `apt upgrade` picks up new releases):
+
+```sh
+curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+sudo apt update && sudo apt install megadl-rs
+```
+
+Or download the archive, `.deb`, or `.pkg.tar.zst` for your platform from the
+[releases page](https://github.com/apiplant/megadl-rs/releases) and install
+it directly — the plain archive needs no installation at all, both binaries
+are static enough to run from anywhere.
+
+| Platform | Ships as |
+| --- | --- |
+| macOS (Apple Silicon) | archive, Homebrew |
+| Linux x86_64 | archive, `.deb` + apt repo, Arch package + pacman repo, Homebrew |
+| Linux aarch64 | archive, `.deb` + apt repo, Homebrew |
+
+See [`packaging/README.md`](packaging/README.md) for how these packages are
+built and published.
+
 ## Features
 
 - Talks to MEGA's API directly (JSON commands, `X-Hashcash` proof-of-work,

@@ -287,11 +287,31 @@ jobs:
 
             The same package is published to the signed pacman repository at
             `apiplant.github.io/pacman`, which is the way to get updates with
-            `pacman -Syu` — see `packaging/README.md` for the one-time setup.
+            `pacman -Syu` (one-time setup, then this repeats nothing):
+
+            ```
+            curl -sSfL https://apiplant.github.io/pacman/apiplant.gpg -o /tmp/apiplant.gpg
+            keyid=$(gpg --show-keys --with-colons /tmp/apiplant.gpg | awk -F: '/^pub:/ { print $5; exit }') && sudo pacman-key --add /tmp/apiplant.gpg && sudo pacman-key --finger "$keyid" && sudo pacman-key --lsign-key "$keyid"
+            printf '\n[apiplant]\nSigLevel = Required DatabaseOptional\nServer = https://apiplant.github.io/pacman/$arch\n' | sudo tee -a /etc/pacman.conf > /dev/null
+            sudo pacman -Sy megadl-rs
+            ```
+
+            ## apt
+
+            The Debian packages above are also published to the signed apt
+            repository at `apt.apiplant.com`, which is the way to get updates
+            with `apt upgrade` (one-time setup):
+
+            ```
+            curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+            sudo apt update && sudo apt install megadl-rs
+            ```
 
             ## Homebrew
 
             ```
+            brew tap apiplant/tap
             brew install apiplant/tap/megadl-rs
             ```
 
@@ -353,6 +373,129 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Formula/megadl-rs.rb
           # Re-running a release for the same tag is a no-op rather than an error.
+          git diff --cached --quiet && exit 0
+          git commit -m "megadl-rs $version"
+          git push
+
+  # The apt repository is cumulative: the new .debs are copied into the pool
+  # alongside the packages from other apiplant releases, and the indices are
+  # regenerated over the whole pool.
+  apt:
+    name: apt repository
+    needs: [packages, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # dpkg-scanpackages and apt-ftparchive are Debian's own tools; the runner
+    # has apt but not dpkg-dev, and a container is cheaper than installing it.
+    container: debian:bookworm
+    env:
+      APT_REPO_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg git ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          path: source
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: debs
+          name: debian-packages
+
+      - name: Import the signing key
+        if: env.APT_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::APT_REPO_TOKEN is set but APT_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          # The key id is needed explicitly: a CI keyring with one secret key
+          # still has no default, and an unsigned Release is one apt refuses.
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the packages to the pool
+        if: env.APT_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${APT_REPO_TOKEN}@github.com/apiplant/apt.git" repo
+
+          # `pool/main/m/megadl-rs/` is the layout apt expects: component,
+          # then the first letter of the source package, then the package.
+          mkdir -p repo/pool/main/m/megadl-rs
+          cp debs/*.deb repo/pool/main/m/megadl-rs/
+
+          size=$(du -sm repo/pool | cut -f1)
+          if [ "$size" -gt 700 ]; then
+            echo "::warning::the apt pool is ${size}MB; GitHub Pages stops at 1GB." \
+                 "Prune old versions from apiplant/apt or move the pool elsewhere."
+          fi
+
+      - name: Generate the indices
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        run: |
+          for arch in amd64 arm64; do
+            dir="dists/stable/main/binary-$arch"
+            mkdir -p "$dir"
+            # /dev/null as the override file: there is no Debian override
+            # database here, and dpkg-scanpackages insists on the argument.
+            dpkg-scanpackages --arch "$arch" pool /dev/null > "$dir/Packages"
+            gzip -9kf "$dir/Packages"
+            test -s "$dir/Packages"
+          done
+
+          # Written outside the tree and moved in: apt-ftparchive checksums
+          # every file under dists/stable, and a Release file it is midway
+          # through writing is one of them.
+          apt-ftparchive -c ../source/packaging/apt/apt-ftparchive.conf \
+            release dists/stable > /tmp/Release
+          mv /tmp/Release dists/stable/Release
+
+      - name: Sign and publish
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          # A passphrase-less key needs no --passphrase, and passing an empty
+          # one to gpg is an error rather than a no-op. Held in the positional
+          # parameters rather than an array: this job runs in a container, where
+          # the step shell is plain sh and `pass=()` is a syntax error.
+          set --
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            set -- --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE"
+          fi
+
+          # Both signatures: InRelease is what apt fetches, Release.gpg is what
+          # older clients and mirroring tools still look for.
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --detach-sign --armor -o dists/stable/Release.gpg dists/stable/Release
+
+          # The keyring users install, dearmored so it can be dropped into
+          # /usr/share/keyrings and named by `signed-by` as-is.
+          rm -f apiplant.gpg
+          gpg --export "$keyid" > apiplant.gpg
+
+          # GitHub Pages runs Jekyll otherwise, which would rewrite parts of a
+          # tree that has to be served byte-for-byte.
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
           git diff --cached --quiet && exit 0
           git commit -m "megadl-rs $version"
           git push
